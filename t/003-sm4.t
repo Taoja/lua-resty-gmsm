@@ -70,10 +70,20 @@ ok
 
 === TEST 3: SM4 GCM authenticated round trip
 --- skip_eval
-    my $o = "$ENV{OPENSSL_PREFIX}/bin/openssl";
-    return 0 unless -x $o;                       # 未设 prefix 就不跳过（本地跑照常执行）
-    my $out = `$o list -cipher-algorithms 2>/dev/null`;
-    $out =~ /SM4-GCM/i ? 0 : "SM4-GCM unsupported by this OpenSSL"
+    my $ver = $ENV{OPENSSL_VERSION} // '';
+    return 0 if $ver eq '';                       # 未设版本号就不跳过（本地跑照常执行）
+    $ver =~ s/^\s*openssl[-\s]*//i;               # 兼容 "openssl-3.0.0" / "OpenSSL 3.5.0" 这类前缀
+    my ($major, $minor);
+    if ($ver =~ /(\d+)\.(\d+)/) {
+        ($major, $minor) = ($1, $2);
+    } elsif ($ver =~ /(\d+)/) {
+        ($major, $minor) = ($1, 0);
+    } else {
+        return 0;                                 # 解析不出版本号，不跳过
+    }
+    # SM4-GCM 自 OpenSSL 3.0 起进入 default provider
+    return 0 if $major > 3 || ($major == 3 && $minor >= 0);
+    "SM4-GCM requires OpenSSL >= 3.0, got $ENV{OPENSSL_VERSION}"
 --- http_config
     lua_package_path "$prefix/lib/?.lua;$prefix/../../lib/?.lua;;";
 --- config

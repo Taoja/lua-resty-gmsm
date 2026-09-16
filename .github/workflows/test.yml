@@ -4,17 +4,24 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # 每周保活：GitHub 会删除 7 天未被访问的缓存条目，定时任务防止全矩阵缓存过期
+  schedule:
+    - cron: '0 3 * * 1'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # 默认分支上不取消：job 被 cancel 时 actions/cache 的 post 保存不会执行，
+  # 每次 push 互相取消 = 缓存永远建立不起来
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
 
 jobs:
   test:
     name: "OpenSSL ${{ matrix.ssl }} + OpenResty ${{ matrix.or }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # 4.0 属于探索性组合，允许失败而不阻塞整体 CI
     continue-on-error: ${{ matrix.experimental }}
 
     strategy:
@@ -24,10 +31,6 @@ jobs:
           # ── tag 规则不一致，必须显式写死 ──
           #   1.1.1 系列：tag = OpenSSL_1_1_1w ，tarball = openssl-1.1.1w.tar.gz
           #   3.x/4.x ：tag = openssl-3.6.4     ，tarball = openssl-3.6.4.tar.gz
-          #
-          # sm4: require = 强断言必须存在；skip = 只提示不失败
-          #   SM4-GCM 官方主线直到 3.x 中后期才齐全（openEuler 给 3.0.12 打的还是 backport 补丁），
-          #   1.1.1 官方版本更是完全没有 SM2/SM3/SM4 代码，所以这两档设 skip。
           - ssl: "1.1.1w"
             ssl_tag: "OpenSSL_1_1_1w"
             or: "1.25.3.2"
@@ -64,43 +67,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl perl \
-            cpanminus libipc-run-perl ccache \
+            cpanminus libipc-run-perl \
             libpcre3-dev libpcre2-dev zlib1g-dev
           gcc --version
           perl -v | head -2
 
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          # 按组合分桶，避免 4 个 OpenSSL 互相把对方的缓存挤掉
-          key: ${{ runner.os }}-cc-${{ matrix.or }}-ssl${{ matrix.ssl }}
-          max-size: 1G
-          create-symlink: true
-          evict-old-files: 'job'
-
-      # ---------- OpenSSL（独立缓存，升 OpenResty 时不重编） ----------
-      - name: Cache OpenSSL
-        id: cache-ssl
-        uses: actions/cache@v4
+      # ================= OpenSSL =================
+      # restore / save 拆开写，好处：
+      #   1. 可以用 outcome 精确控制"只在构建成功时保存"，避免写入半成品
+      #   2. 测试失败时仍能保住已编译好的依赖（save-always 语义）
+      - name: Restore OpenSSL
+        id: ssl-cache
+        uses: actions/cache/restore@v4
         with:
           path: /home/runner/opt/openssl-${{ matrix.ssl }}
           key: ssl-${{ runner.os }}-${{ matrix.ssl }}-shared
 
       - name: Build shared OpenSSL
-        if: steps.cache-ssl.outputs.cache-hit != 'true'
+        id: build-ssl
+        if: steps.ssl-cache.outputs.cache-hit != 'true'
         run: |
           set -eux
           mkdir -p "${RUNNER_TEMP}/ssl-build"
           cd "${RUNNER_TEMP}/ssl-build"
 
-          export PATH="/usr/lib/ccache:$PATH"
-          export CCACHE_COMPILERCHECK=content
-          export CCACHE_SLOPPINESS=time_macros
-
-          # 主源 GitHub（tag 规则随大版本变化），失败再回落 openssl.org
-          # 老版本归档在 /source/old/<分支>/ 下。注意分支名规则不统一：
-          #   1.1.1w → old/1.1.1/（不能写成 ${V%.*}，那会剥成 1.1）
-          #   3.0.22 → old/3.0/ ，3.6.4 → old/3.6/ ，即取前两段
           case "$OPENSSL_VERSION" in
             1.*) SSL_SERIES="1.1.1" ;;
             *)   SSL_SERIES="$(echo "$OPENSSL_VERSION" | cut -d. -f1-2)" ;;
@@ -124,19 +114,8 @@ jobs:
           tar -xzf openssl.tar.gz
           cd "openssl-${OPENSSL_VERSION}"
 
-          # 1.1.1 与 3.x/4.x 的 Configure 不是同一套参数，必须分开：
-          #
-          # 1) 1.1.1 必须用小写 ./config（自动探测 os/compiler）。
-          #    大写的 ./Configure 强制要求显式给 target（linux-x86_64 等），
-          #    否则报 "pick os/compiler from:" 并以 exit 1 退出。
-          # 2) 1.1.1 没有 --libdir 选项，其默认安装目录就叫 lib，无需指定。
-          #    （3.x/4.x 在 linux-x86_64 上默认 lib64，所以必须 --libdir=lib）
-          # 3) 1.1.1 只识别 -Wl,-rpath / -R，不认识 -Wl,--enable-new-dtags，
-          #    传进去会被当成未知参数。因此 1.1.1 生成的是 DT_RPATH 而非 DT_RUNPATH，
-          #    下面断言步骤对两者都放行。
-          #
-          # 共同点：'-Wl,-rpath,$(LIBRPATH)' 必须单引号，让 make 去展开 LIBRPATH，
-          # 否则 openssl 会链到系统库。
+          # 1.1.1 必须小写 ./config（大写 Configure 强制要求显式 target）；
+          # 1.1.1 无 --libdir，且不认识 -Wl,--enable-new-dtags
           case "$OPENSSL_VERSION" in
             1.*)
               ./config \
@@ -157,56 +136,66 @@ jobs:
           esac
 
           make -j"$(nproc)"
-
-          # 1.1.1 的 Makefile 不一定有 install_ssldirs 目标，失败就退回纯 install_sw
           if ! make install_sw install_ssldirs; then
             echo "::warning::install_ssldirs 不可用，退回 install_sw"
             make install_sw
           fi
-          ccache -s
 
-      # 无论是否命中缓存，都做一次硬校验（缓存内容可能是坏的）
+          # ---- 瘦身：静态库 / pkgconfig / man / doc 一律不需要，.so 去符号表 ----
+          rm -rf "$OPENSSL_PREFIX/lib/pkgconfig" \
+                 "$OPENSSL_PREFIX/share/man" \
+                 "$OPENSSL_PREFIX/share/doc" \
+                 "$OPENSSL_PREFIX/html"
+          rm -f  "$OPENSSL_PREFIX/lib/"*.a
+          find "$OPENSSL_PREFIX/lib" -name '*.so*' -type f \
+            -exec strip --strip-unneeded {} + 2>/dev/null || true
+          strip --strip-unneeded "$OPENSSL_PREFIX/bin/openssl" 2>/dev/null || true
+
+      - name: Save OpenSSL
+        # outcome 判断保证只存完整产物；always() 保证后续测试失败也不丢缓存
+        if: always() && steps.build-ssl.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/opt/openssl-${{ matrix.ssl }}
+          key: ssl-${{ runner.os }}-${{ matrix.ssl }}-shared
+
+      # 无论是否命中缓存都做硬校验（缓存内容可能是坏的）
       - name: Assert OpenSSL build
         run: |
           set -eux
           "$OPENSSL_PREFIX/bin/openssl" version
 
-          # soname 随大版本变：1.1.1 → libcrypto.so.1.1，3.x → .so.3，4.x 另行演进
           LIBCRYPTO="$(ls "$OPENSSL_PREFIX"/lib/libcrypto.so.* 2>/dev/null | head -1)"
           [ -n "$LIBCRYPTO" ] || { echo "::error::未找到 libcrypto.so.*"; ls -l "$OPENSSL_PREFIX/lib"; exit 1; }
           echo "libcrypto = $LIBCRYPTO"
 
-          # 1.1.1 生成 DT_RPATH，3.x/4.x 生成 DT_RUNPATH，两者都算通过；
-          # 缺失只警告，真正会出事的是下面 ldd 指向系统库。
           readelf -d "$LIBCRYPTO"                  | grep -E 'RPATH|RUNPATH' \
             || echo "::warning::libcrypto 无 RPATH/RUNPATH（对 1.1.1 可接受）"
           readelf -d "$OPENSSL_PREFIX/bin/openssl" | grep -E 'RPATH|RUNPATH' \
             || echo "::warning::openssl 可执行文件无 RPATH/RUNPATH"
 
-          # 硬断言：必须指向自己 prefix 下的库，绝不能落到 /lib/x86_64-linux-gnu
           LD_LIBRARY_PATH="$OPENSSL_PREFIX/lib" ldd "$OPENSSL_PREFIX/bin/openssl" \
             | grep -E 'libcrypto|libssl' | grep -q "$OPENSSL_PREFIX" \
             || { echo "::error::openssl 仍链到系统库"; \
                  LD_LIBRARY_PATH="$OPENSSL_PREFIX/lib" ldd "$OPENSSL_PREFIX/bin/openssl"; exit 1; }
 
-      # ---------- OpenResty（动态链接到上面的 OpenSSL） ----------
-      - name: Cache OpenResty
-        id: cache-or
-        uses: actions/cache@v4
+      # ================= OpenResty =================
+      # 单独一个 key：与 OpenSSL 分离是安全的，因为 prefix 路径由 matrix 固定，
+      # 即使 OpenSSL 缓存被驱逐而本缓存命中，重建 OpenSSL 后 rpath 依然指向同一路径
+      - name: Restore OpenResty
+        id: or-cache
+        uses: actions/cache/restore@v4
         with:
           path: /home/runner/opt/openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}
           key: or-${{ runner.os }}-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared
 
       - name: Build OpenResty
-        if: steps.cache-or.outputs.cache-hit != 'true'
+        id: build-or
+        if: steps.or-cache.outputs.cache-hit != 'true'
         run: |
           set -eux
           mkdir -p "${RUNNER_TEMP}/or-build"
           cd "${RUNNER_TEMP}/or-build"
-
-          export PATH="/usr/lib/ccache:$PATH"
-          export CCACHE_COMPILERCHECK=content
-          export CCACHE_SLOPPINESS=time_macros
 
           curl -fL --retry 3 --retry-delay 5 --max-time 300 \
             "https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz" \
@@ -215,7 +204,7 @@ jobs:
           cd "openresty-${OPENRESTY_VERSION}"
 
           # OpenResty 1.31 起内核自带 PCRE2，--with-pcre-jit 可能不再存在，
-          # 而 nginx configure 遇到未知选项会直接 error 退出，所以先探测
+          # nginx configure 遇到未知选项会直接 error 退出，所以先探测
           PCRE_OPT=""
           if ./configure --help 2>&1 | grep -q 'with-pcre2-jit'; then
             PCRE_OPT="--with-pcre2-jit"
@@ -224,7 +213,7 @@ jobs:
           fi
           echo "PCRE_OPT=$PCRE_OPT"
 
-          # 不用 --with-openssl（那是静态链接，FFI 够不着）
+          # 不用 --with-openssl（静态链接，FFI 够不着）；
           # 改用 -I / -L 指向已安装的共享库，并把 rpath 编进 nginx
           ./configure \
             --prefix="$OPENRESTY_PREFIX" \
@@ -240,7 +229,29 @@ jobs:
 
           make -j"$(nproc)"
           make install
-          ccache -s
+
+          # ---- 瘦身：luarocks / pod / man / COPYRIGHT 都不参与测试 ----
+          rm -rf "$OPENRESTY_PREFIX/luarocks" \
+                 "$OPENRESTY_PREFIX/pod" \
+                 "$OPENRESTY_PREFIX/site/pod" \
+                 "$OPENRESTY_PREFIX/site/man" \
+                 "$OPENRESTY_PREFIX/COPYRIGHT" \
+                 "$OPENRESTY_PREFIX/README" \
+                 "$OPENRESTY_PREFIX/bin/restydoc" \
+                 "$OPENRESTY_PREFIX/bin/restydoc-index" \
+                 "$OPENRESTY_PREFIX/bin/md2pod.pl" \
+                 "$OPENRESTY_PREFIX/bin/nginx-xml2pod"
+          find "$OPENRESTY_PREFIX" -name '*.pod' -delete 2>/dev/null || true
+          find "$OPENRESTY_PREFIX/nginx/sbin" "$OPENRESTY_PREFIX/luajit/bin" \
+            "$OPENRESTY_PREFIX/bin" -type f \
+            -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+      - name: Save OpenResty
+        if: always() && steps.build-or.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/opt/openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}
+          key: or-${{ runner.os }}-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared
 
       - name: Assert OpenResty linkage
         run: |
@@ -254,14 +265,19 @@ jobs:
             || { echo "::error::nginx 的 libcrypto 未指向 $OPENSSL_PREFIX"; \
                  ldd "$OPENRESTY_PREFIX/nginx/sbin/nginx" | grep -E 'libcrypto|libssl'; exit 1; }
 
-      # ---------- Test::Nginx ----------
-      - name: Cache Perl modules
-        uses: actions/cache@v4
+      # ================= Test::Nginx =================
+      # 4 个组合共享同一 key（内容本来一样）。并发保存时只有 1 个会成功，
+      # 其余 3 个报 "Cache already exists" 属正常噪音，不是故障
+      - name: Restore Perl modules
+        id: perl-cache
+        uses: actions/cache/restore@v4
         with:
           path: /home/runner/perl5
           key: perl5-${{ runner.os }}-test-nginx
 
       - name: Install Test::Nginx
+        id: perl-install
+        if: steps.perl-cache.outputs.cache-hit != 'true'
         run: |
           set -eux
           PERL_ARCH="$(perl -MConfig -e 'print $Config{archname}')"
@@ -271,12 +287,31 @@ jobs:
             > build.log 2>&1 || (cat build.log && exit 1)
           perl -MTest::Nginx::Socket -e1
 
-      # ---------- 运行 ----------
+      - name: Export PERL5LIB
+        if: steps.perl-cache.outputs.cache-hit == 'true'
+        run: |
+          set -eux
+          PERL_ARCH="$(perl -MConfig -e 'print $Config{archname}')"
+          echo "PERL5LIB=$HOME/perl5/lib/perl5:$HOME/perl5/lib/perl5/$PERL_ARCH" >> "$GITHUB_ENV"
+
+      - name: Save Perl modules
+        if: always() && steps.perl-install.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/perl5
+          key: perl5-${{ runner.os }}-test-nginx
+
+      # ================= 运行 =================
       - name: Setup runtime env
         run: |
           set -eux
           echo "$OPENRESTY_PREFIX/nginx/sbin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+
+      - name: Report cache footprint
+        run: |
+          du -sh "$OPENSSL_PREFIX" 2>/dev/null || true
+          du -sh "$OPENRESTY_PREFIX" 2>/dev/null || true
 
       - name: Run tests
         run: |
