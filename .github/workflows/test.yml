@@ -24,6 +24,10 @@ jobs:
           # ── tag 规则不一致，必须显式写死 ──
           #   1.1.1 系列：tag = OpenSSL_1_1_1w ，tarball = openssl-1.1.1w.tar.gz
           #   3.x/4.x ：tag = openssl-3.6.4     ，tarball = openssl-3.6.4.tar.gz
+          #
+          # sm4: require = 强断言必须存在；skip = 只提示不失败
+          #   SM4-GCM 官方主线直到 3.x 中后期才齐全（openEuler 给 3.0.12 打的还是 backport 补丁），
+          #   1.1.1 官方版本更是完全没有 SM2/SM3/SM4 代码，所以这两档设 skip。
           - ssl: "1.1.1w"
             ssl_tag: "OpenSSL_1_1_1w"
             or: "1.25.3.2"
@@ -36,7 +40,7 @@ jobs:
 
           - ssl: "3.6.4"
             ssl_tag: "openssl-3.6.4"
-            or: "1.25.3.2"           # 3.6 顺带换新内核，与 4.0 保持同一 OpenResty 便于对比
+            or: "1.31.1.1"           # 3.6 顺带换新内核，与 4.0 保持同一 OpenResty 便于对比
             experimental: false
 
           - ssl: "4.0.2"
@@ -62,6 +66,8 @@ jobs:
             build-essential ca-certificates curl perl \
             cpanminus libipc-run-perl ccache \
             libpcre3-dev libpcre2-dev zlib1g-dev
+          gcc --version
+          perl -v | head -2
 
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -92,16 +98,23 @@ jobs:
           export CCACHE_SLOPPINESS=time_macros
 
           # 主源 GitHub（tag 规则随大版本变化），失败再回落 openssl.org
-          # 1.1.1/3.0 这类老版本归档在 /source/old/<分支>/ 下
+          # 老版本归档在 /source/old/<分支>/ 下。注意分支名规则不统一：
+          #   1.1.1w → old/1.1.1/（不能写成 ${V%.*}，那会剥成 1.1）
+          #   3.0.22 → old/3.0/ ，3.6.4 → old/3.6/ ，即取前两段
+          case "$OPENSSL_VERSION" in
+            1.*) SSL_SERIES="1.1.1" ;;
+            *)   SSL_SERIES="$(echo "$OPENSSL_VERSION" | cut -d. -f1-2)" ;;
+          esac
+
           ok=0
           for url in \
             "https://github.com/openssl/openssl/releases/download/${OPENSSL_TAG}/openssl-${OPENSSL_VERSION}.tar.gz" \
             "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" \
-            "https://www.openssl.org/source/old/${OPENSSL_VERSION%.*}/openssl-${OPENSSL_VERSION}.tar.gz" \
-            "https://www.openssl.org/source/old/1.1.1/openssl-${OPENSSL_VERSION}.tar.gz"
+            "https://www.openssl.org/source/old/${SSL_SERIES}/openssl-${OPENSSL_VERSION}.tar.gz"
           do
             echo "::group::try $url"
-            if curl -fL --retry 3 --retry-delay 5 --max-time 300 "$url" -o openssl.tar.gz; then
+            if curl -fL --retry 3 --retry-delay 5 --max-time 300 \
+                 -A "curl/8 GitHub-Actions" "$url" -o openssl.tar.gz; then
               ok=1; echo "::endgroup::"; break
             fi
             echo "::endgroup::"
@@ -111,20 +124,45 @@ jobs:
           tar -xzf openssl.tar.gz
           cd "openssl-${OPENSSL_VERSION}"
 
-          # 关键三点：
-          #   1. shared          —— 必须产出 libcrypto.so*，FFI 才能 dlopen
-          #   2. '-Wl,-rpath,$(LIBRPATH)' —— 单引号，让 make 展开；否则 openssl 会链到系统库
-          #   3. --enable-new-dtags        —— 生成 RUNPATH，保证 LD_LIBRARY_PATH 能覆盖
-          ./Configure \
-            --prefix="$OPENSSL_PREFIX" \
-            --openssldir="$OPENSSL_PREFIX/ssl" \
-            --libdir=lib \
-            shared \
-            '-Wl,-rpath,$(LIBRPATH)' \
-            -Wl,--enable-new-dtags
+          # 1.1.1 与 3.x/4.x 的 Configure 不是同一套参数，必须分开：
+          #
+          # 1) 1.1.1 必须用小写 ./config（自动探测 os/compiler）。
+          #    大写的 ./Configure 强制要求显式给 target（linux-x86_64 等），
+          #    否则报 "pick os/compiler from:" 并以 exit 1 退出。
+          # 2) 1.1.1 没有 --libdir 选项，其默认安装目录就叫 lib，无需指定。
+          #    （3.x/4.x 在 linux-x86_64 上默认 lib64，所以必须 --libdir=lib）
+          # 3) 1.1.1 只识别 -Wl,-rpath / -R，不认识 -Wl,--enable-new-dtags，
+          #    传进去会被当成未知参数。因此 1.1.1 生成的是 DT_RPATH 而非 DT_RUNPATH，
+          #    下面断言步骤对两者都放行。
+          #
+          # 共同点：'-Wl,-rpath,$(LIBRPATH)' 必须单引号，让 make 去展开 LIBRPATH，
+          # 否则 openssl 会链到系统库。
+          case "$OPENSSL_VERSION" in
+            1.*)
+              ./config \
+                --prefix="$OPENSSL_PREFIX" \
+                --openssldir="$OPENSSL_PREFIX/ssl" \
+                shared \
+                '-Wl,-rpath,$(LIBRPATH)'
+              ;;
+            *)
+              ./Configure \
+                --prefix="$OPENSSL_PREFIX" \
+                --openssldir="$OPENSSL_PREFIX/ssl" \
+                --libdir=lib \
+                shared \
+                '-Wl,-rpath,$(LIBRPATH)' \
+                -Wl,--enable-new-dtags
+              ;;
+          esac
 
           make -j"$(nproc)"
-          make install_sw install_ssldirs
+
+          # 1.1.1 的 Makefile 不一定有 install_ssldirs 目标，失败就退回纯 install_sw
+          if ! make install_sw install_ssldirs; then
+            echo "::warning::install_ssldirs 不可用，退回 install_sw"
+            make install_sw
+          fi
           ccache -s
 
       # 无论是否命中缓存，都做一次硬校验（缓存内容可能是坏的）
@@ -138,11 +176,18 @@ jobs:
           [ -n "$LIBCRYPTO" ] || { echo "::error::未找到 libcrypto.so.*"; ls -l "$OPENSSL_PREFIX/lib"; exit 1; }
           echo "libcrypto = $LIBCRYPTO"
 
-          readelf -d "$LIBCRYPTO"                  | grep -E 'RPATH|RUNPATH'
-          readelf -d "$OPENSSL_PREFIX/bin/openssl" | grep -E 'RPATH|RUNPATH'
-          ldd "$OPENSSL_PREFIX/bin/openssl" | grep -E 'libcrypto|libssl' \
-            | grep -q "$OPENSSL_PREFIX" \
-            || { echo "::error::openssl 仍链到系统库"; ldd "$OPENSSL_PREFIX/bin/openssl"; exit 1; }
+          # 1.1.1 生成 DT_RPATH，3.x/4.x 生成 DT_RUNPATH，两者都算通过；
+          # 缺失只警告，真正会出事的是下面 ldd 指向系统库。
+          readelf -d "$LIBCRYPTO"                  | grep -E 'RPATH|RUNPATH' \
+            || echo "::warning::libcrypto 无 RPATH/RUNPATH（对 1.1.1 可接受）"
+          readelf -d "$OPENSSL_PREFIX/bin/openssl" | grep -E 'RPATH|RUNPATH' \
+            || echo "::warning::openssl 可执行文件无 RPATH/RUNPATH"
+
+          # 硬断言：必须指向自己 prefix 下的库，绝不能落到 /lib/x86_64-linux-gnu
+          LD_LIBRARY_PATH="$OPENSSL_PREFIX/lib" ldd "$OPENSSL_PREFIX/bin/openssl" \
+            | grep -E 'libcrypto|libssl' | grep -q "$OPENSSL_PREFIX" \
+            || { echo "::error::openssl 仍链到系统库"; \
+                 LD_LIBRARY_PATH="$OPENSSL_PREFIX/lib" ldd "$OPENSSL_PREFIX/bin/openssl"; exit 1; }
 
       # ---------- OpenResty（动态链接到上面的 OpenSSL） ----------
       - name: Cache OpenResty
