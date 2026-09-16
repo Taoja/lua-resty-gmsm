@@ -1,3 +1,8 @@
+use Test::Nginx::Socket 'no_plan';
+run_tests();
+
+__DATA__
+
 === TEST 1: which openssl does Lua see
 --- main_config
 env OPENSSL_VERSION;
