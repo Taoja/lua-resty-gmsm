@@ -22,8 +22,6 @@ const EVP_CIPHER *EVP_sm4_cbc(void);
 const EVP_CIPHER *EVP_sm4_cfb128(void);
 const EVP_CIPHER *EVP_sm4_ofb(void);
 const EVP_CIPHER *EVP_sm4_ctr(void);
-const EVP_CIPHER *EVP_sm4_ccm(void);
-const EVP_CIPHER *EVP_sm4_xts(void);
 
 OSSL_PARAM OSSL_PARAM_construct_size_t(const char *key, size_t *buf);
 OSSL_PARAM OSSL_PARAM_construct_octet_string(const char *key, void *buf,

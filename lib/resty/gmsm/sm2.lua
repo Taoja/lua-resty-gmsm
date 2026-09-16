@@ -36,9 +36,6 @@ EVP_PKEY_CTX *EVP_PKEY_CTX_new_from_name(OSSL_LIB_CTX *libctx,
     const char *propquery);
 int EVP_PKEY_paramgen_init(EVP_PKEY_CTX *ctx);
 
-EVP_PKEY *EVP_PKEY_new(void);
-EC_KEY *EC_KEY_new_by_curve_name(int nid);
-int EVP_PKEY_assign(EVP_PKEY *pkey, int type, void *key);
 EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e);
 
 EVP_MD_CTX *EVP_MD_CTX_new(void);
