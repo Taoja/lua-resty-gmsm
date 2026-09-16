@@ -69,11 +69,18 @@ ok
 [error]
 
 === TEST 3: SM4 GCM authenticated round trip
+--- skip_eval
+    my $o = "$ENV{OPENSSL_PREFIX}/bin/openssl";
+    return 0 unless -x $o;                       # 未设 prefix 就不跳过（本地跑照常执行）
+    my $out = `$o list -cipher-algorithms 2>/dev/null`;
+    $out =~ /SM4-GCM/i ? 0 : "SM4-GCM unsupported by this OpenSSL"
 --- http_config
     lua_package_path "$prefix/lib/?.lua;$prefix/../../lib/?.lua;;";
 --- config
     location /t {
         content_by_lua_block {
+            local version = os.getenv("OPENSSL_VERSION")
+            
             local sm4 = require "resty.gmsm.sm4"
             local key = string.rep("k", 16)
             local iv = string.rep("i", 12)
