@@ -11,14 +11,49 @@ concurrency:
 
 jobs:
   test:
+    name: "OpenSSL ${{ matrix.ssl }} + OpenResty ${{ matrix.or }}"
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
+    # 4.0 属于探索性组合，允许失败而不阻塞整体 CI
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── tag 规则不一致，必须显式写死 ──
+          #   1.1.1 系列：tag = OpenSSL_1_1_1w ，tarball = openssl-1.1.1w.tar.gz
+          #   3.x/4.x ：tag = openssl-3.6.4     ，tarball = openssl-3.6.4.tar.gz
+          - ssl: "1.1.1w"
+            ssl_tag: "OpenSSL_1_1_1w"
+            or: "1.25.3.2"
+            require_sm4_gcm: false   # 1.1.1 的 SM4-GCM 只做软校验，避免误伤
+            experimental: false
+
+          - ssl: "3.0.22"
+            ssl_tag: "openssl-3.0.22"
+            or: "1.25.3.2"
+            require_sm4_gcm: true
+            experimental: false
+
+          - ssl: "3.6.4"
+            ssl_tag: "openssl-3.6.4"
+            or: "1.31.1.1"           # 3.6 顺带换新内核，与 4.0 保持同一 OpenResty 便于对比
+            require_sm4_gcm: true
+            experimental: false
+
+          - ssl: "4.0.2"
+            ssl_tag: "openssl-4.0.2"
+            or: "1.31.1.1"           # 必需：nginx < 1.31.1 编不过 OpenSSL 4.0
+            require_sm4_gcm: true
+            experimental: true
 
     env:
-      OPENSSL_VERSION: "3.6.3"
-      OPENRESTY_VERSION: "1.25.3.2"
-      OPENSSL_PREFIX: "/home/runner/opt/openssl-3.6.3"
-      OPENRESTY_PREFIX: "/home/runner/opt/openresty"
+      OPENSSL_VERSION:   ${{ matrix.ssl }}
+      OPENSSL_TAG:       ${{ matrix.ssl_tag }}
+      OPENRESTY_VERSION: ${{ matrix.or }}
+      OPENSSL_PREFIX:   "/home/runner/opt/openssl-${{ matrix.ssl }}"
+      OPENRESTY_PREFIX: "/home/runner/opt/openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}"
 
     steps:
       - uses: actions/checkout@v4
@@ -30,12 +65,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl perl \
             cpanminus libipc-run-perl ccache \
-            libpcre3-dev zlib1g-dev
+            libpcre3-dev libpcre2-dev zlib1g-dev
 
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: ${{ runner.os }}-cc-openresty
+          # 按组合分桶，避免 4 个 OpenSSL 互相把对方的缓存挤掉
+          key: ${{ runner.os }}-cc-${{ matrix.or }}-ssl${{ matrix.ssl }}
           max-size: 1G
           create-symlink: true
           evict-old-files: 'job'
@@ -45,8 +81,8 @@ jobs:
         id: cache-ssl
         uses: actions/cache@v4
         with:
-          path: /home/runner/opt/openssl-3.6.3
-          key: ssl-${{ runner.os }}-${{ env.OPENSSL_VERSION }}-shared
+          path: /home/runner/opt/openssl-${{ matrix.ssl }}
+          key: ssl-${{ runner.os }}-${{ matrix.ssl }}-shared
 
       - name: Build shared OpenSSL
         if: steps.cache-ssl.outputs.cache-hit != 'true'
@@ -59,14 +95,28 @@ jobs:
           export CCACHE_COMPILERCHECK=content
           export CCACHE_SLOPPINESS=time_macros
 
-          curl -fL --retry 3 --retry-delay 5 \
-            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
-            -o openssl.tar.gz
+          # 主源 GitHub（tag 规则随大版本变化），失败再回落 openssl.org
+          # 1.1.1/3.0 这类老版本归档在 /source/old/<分支>/ 下
+          ok=0
+          for url in \
+            "https://github.com/openssl/openssl/releases/download/${OPENSSL_TAG}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" \
+            "https://www.openssl.org/source/old/${OPENSSL_VERSION%.*}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            "https://www.openssl.org/source/old/1.1.1/openssl-${OPENSSL_VERSION}.tar.gz"
+          do
+            echo "::group::try $url"
+            if curl -fL --retry 3 --retry-delay 5 --max-time 300 "$url" -o openssl.tar.gz; then
+              ok=1; echo "::endgroup::"; break
+            fi
+            echo "::endgroup::"
+          done
+          [ "$ok" = 1 ] || { echo "::error::找不到 OpenSSL ${OPENSSL_VERSION} 的源码包"; exit 1; }
+
           tar -xzf openssl.tar.gz
           cd "openssl-${OPENSSL_VERSION}"
 
           # 关键三点：
-          #   1. shared          —— 必须产出 libcrypto.so，FFI 才能 dlopen
+          #   1. shared          —— 必须产出 libcrypto.so*，FFI 才能 dlopen
           #   2. '-Wl,-rpath,$(LIBRPATH)' —— 单引号，让 make 展开；否则 openssl 会链到系统库
           #   3. --enable-new-dtags        —— 生成 RUNPATH，保证 LD_LIBRARY_PATH 能覆盖
           ./Configure \
@@ -86,22 +136,34 @@ jobs:
         run: |
           set -eux
           "$OPENSSL_PREFIX/bin/openssl" version
-          readelf -d "$OPENSSL_PREFIX/lib/libcrypto.so.3" | grep -E 'RPATH|RUNPATH'
-          readelf -d "$OPENSSL_PREFIX/bin/openssl"        | grep -E 'RPATH|RUNPATH'
+
+          # soname 随大版本变：1.1.1 → libcrypto.so.1.1，3.x → .so.3，4.x 另行演进
+          LIBCRYPTO="$(ls "$OPENSSL_PREFIX"/lib/libcrypto.so.* 2>/dev/null | head -1)"
+          [ -n "$LIBCRYPTO" ] || { echo "::error::未找到 libcrypto.so.*"; ls -l "$OPENSSL_PREFIX/lib"; exit 1; }
+          echo "libcrypto = $LIBCRYPTO"
+
+          readelf -d "$LIBCRYPTO"                  | grep -E 'RPATH|RUNPATH'
+          readelf -d "$OPENSSL_PREFIX/bin/openssl" | grep -E 'RPATH|RUNPATH'
           ldd "$OPENSSL_PREFIX/bin/openssl" | grep -E 'libcrypto|libssl' \
             | grep -q "$OPENSSL_PREFIX" \
             || { echo "::error::openssl 仍链到系统库"; ldd "$OPENSSL_PREFIX/bin/openssl"; exit 1; }
-          # 我们的目标能力：SM4-GCM（3.3+ 才有）
-          "$OPENSSL_PREFIX/bin/openssl" list -cipher-algorithms | grep -i 'SM4-GCM' \
-            || { echo "::error::该 OpenSSL 未启用 SM4-GCM"; exit 1; }
+
+          # 目标能力：SM4-GCM（1.1.1 起就有，但只在 3.x+ 组合上做强断言）
+          if "$OPENSSL_PREFIX/bin/openssl" list -cipher-algorithms | grep -i 'SM4-GCM'; then
+            echo "SM4-GCM OK"
+          elif [ "${{ matrix.require_sm4_gcm }}" = "true" ]; then
+            echo "::error::该 OpenSSL 未启用 SM4-GCM"; exit 1
+          else
+            echo "::warning::该 OpenSSL 未列出 SM4-GCM（非强制组合，继续）"
+          fi
 
       # ---------- OpenResty（动态链接到上面的 OpenSSL） ----------
       - name: Cache OpenResty
         id: cache-or
         uses: actions/cache@v4
         with:
-          path: /home/runner/opt/openresty
-          key: or-${{ runner.os }}-${{ env.OPENRESTY_VERSION }}-ssl${{ env.OPENSSL_VERSION }}-shared
+          path: /home/runner/opt/openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}
+          key: or-${{ runner.os }}-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared
 
       - name: Build OpenResty
         if: steps.cache-or.outputs.cache-hit != 'true'
@@ -114,21 +176,30 @@ jobs:
           export CCACHE_COMPILERCHECK=content
           export CCACHE_SLOPPINESS=time_macros
 
-          curl -fL --retry 3 --retry-delay 5 \
+          curl -fL --retry 3 --retry-delay 5 --max-time 300 \
             "https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz" \
             -o openresty.tar.gz
           tar -xzf openresty.tar.gz
           cd "openresty-${OPENRESTY_VERSION}"
 
+          # OpenResty 1.31 起内核自带 PCRE2，--with-pcre-jit 可能不再存在，
+          # 而 nginx configure 遇到未知选项会直接 error 退出，所以先探测
+          PCRE_OPT=""
+          if ./configure --help 2>&1 | grep -q 'with-pcre2-jit'; then
+            PCRE_OPT="--with-pcre2-jit"
+          elif ./configure --help 2>&1 | grep -q 'with-pcre-jit'; then
+            PCRE_OPT="--with-pcre-jit"
+          fi
+          echo "PCRE_OPT=$PCRE_OPT"
+
           # 不用 --with-openssl（那是静态链接，FFI 够不着）
           # 改用 -I / -L 指向已安装的共享库，并把 rpath 编进 nginx
           ./configure \
             --prefix="$OPENRESTY_PREFIX" \
-            --with-pcre-jit \
+            $PCRE_OPT \
             --with-http_ssl_module \
             --with-http_v2_module \
             --with-http_realip_module \
-            --with-pcre-jit \
             --with-luajit \
             --with-stream \
             --with-stream_ssl_module \
@@ -184,6 +255,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: nginx-error-logs
+          name: nginx-error-logs-ssl${{ matrix.ssl }}-or${{ matrix.or }}
           path: t/servroot/logs/
           if-no-files-found: ignore
