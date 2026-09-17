@@ -49,13 +49,12 @@ int EVP_PKEY_paramgen_init(EVP_PKEY_CTX *ctx);
 EVP_MD_CTX *EVP_MD_CTX_new(void);
 void EVP_MD_CTX_free(EVP_MD_CTX *ctx);
 const EVP_MD *EVP_sm3(void);
+int EVP_DigestUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt);
 int EVP_DigestSignInit(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
                        const EVP_MD *type, ENGINE *e, EVP_PKEY *pkey);
-int EVP_DigestSignUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt);
 int EVP_DigestSignFinal(EVP_MD_CTX *ctx, unsigned char *sig, size_t *siglen);
 int EVP_DigestVerifyInit(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
                          const EVP_MD *type, ENGINE *e, EVP_PKEY *pkey);
-int EVP_DigestVerifyUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt);
 int EVP_DigestVerifyFinal(EVP_MD_CTX *ctx, const unsigned char *sig, size_t siglen);
 const char *OpenSSL_version(int);
 void ERR_clear_error(void);
@@ -488,9 +487,11 @@ function _M:sign(data, id)
     return nil, "EVP_DigestSignInit failed"
   end
 
-  if openssl.EVP_DigestSignUpdate(ctx, data, #data) <= 0 then
+  -- 注意：1.1.1 里 EVP_DigestSignUpdate 只是宏，展开后就是 EVP_DigestUpdate，
+  -- 直接查 EVP_DigestSignUpdate 会 undefined symbol，所以统一用 EVP_DigestUpdate
+  if openssl.EVP_DigestUpdate(ctx, data, #data) <= 0 then
     openssl.EVP_MD_CTX_free(ctx)
-    return nil, "EVP_DigestSignUpdate failed"
+    return nil, "EVP_DigestUpdate failed"
   end
 
   local siglen = ffi.new("size_t[1]")
@@ -535,9 +536,9 @@ function _M:verify(data, signature, id)
     return false, "EVP_DigestVerifyInit failed"
   end
 
-  if openssl.EVP_DigestVerifyUpdate(ctx, data, #data) <= 0 then
+  if openssl.EVP_DigestUpdate(ctx, data, #data) <= 0 then
     openssl.EVP_MD_CTX_free(ctx)
-    return false, "EVP_DigestVerifyUpdate failed"
+    return false, "EVP_DigestUpdate failed"
   end
 
   local sig = ffi.cast("const unsigned char*", signature)
