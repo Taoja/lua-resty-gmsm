@@ -1,3 +1,5 @@
 a.out
 issue.*
 .DS_Store
+
+lua-resty-gmsm-*
