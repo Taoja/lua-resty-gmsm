@@ -1,11 +1,12 @@
 local ffi = require("ffi")
+local load_lib = require("resty.gmsm.load_lib")
 
 ffi.cdef [[
   char *OPENSSL_buf2hexstr(const unsigned char *str, long buflen);
   unsigned char *OPENSSL_hexstr2buf(const char *str, long *buflen);
 ]]
 
-local openssl = ffi.C
+local openssl = load_lib()
 local _M = {}
 
 function _M.encode(data)

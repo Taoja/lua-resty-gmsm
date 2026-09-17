@@ -1,5 +1,6 @@
 local ffi = require "ffi"
 local err = require("resty.gmsm.err_print")
+local load_lib = require("resty.gmsm.load_lib")
 
 ffi.cdef [[
 typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
@@ -47,7 +48,7 @@ int RAND_bytes(unsigned char *buf, int num);
 const char *OpenSSL_version(int);
 ]]
 
-local openssl = ffi.C
+local openssl = load_lib()
 
 local _M = {
   Version = '1.0.1',

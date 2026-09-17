@@ -1,16 +1,17 @@
 local ffi = require("ffi")
 local err = require("resty.gmsm.err_print")
+local load_lib = require("resty.gmsm.load_lib")
 
 ffi.cdef [[
   int EVP_EncodeBlock(unsigned char *t, const unsigned char *f, int n);
   int EVP_DecodeBlock(unsigned char *t, const unsigned char *f, int n);
 ]]
 
-local openssl = ffi.C
+local openssl = load_lib()
 
 local base64 = {}
 
-function trim_trailing_zeros(buf, len)
+local function trim_trailing_zeros(buf, len)
     if len == 0 then return 0 end
     local pos = buf + len        -- 指向末尾之后
     local base = buf

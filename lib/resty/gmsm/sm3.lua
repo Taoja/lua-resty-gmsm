@@ -1,6 +1,7 @@
 -- sm3.lua
 local ffi = require("ffi")
 local err = require("resty.gmsm.err_print")
+local load_lib = require("resty.gmsm.load_lib")
 
 ffi.cdef [[
     typedef struct evp_md_st EVP_MD;
@@ -11,7 +12,7 @@ ffi.cdef [[
     const char *OpenSSL_version(int);
 ]]
 
-local openssl = ffi.C
+local openssl = load_lib()
 
 local _M = {
   Version = '1.0.1',

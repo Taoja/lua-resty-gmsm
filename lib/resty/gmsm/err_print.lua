@@ -1,10 +1,11 @@
 local ffi = require "ffi"
+local load_lib = require "resty.gmsm.load_lib"
 
 ffi.cdef [[
 void ERR_print_errors_cb(int (*cb)(const char *str, size_t len, void *u), void *u);
 ]]
 
-local openssl = ffi.C
+local openssl = load_lib()
 
 local function print()
   local error_str
