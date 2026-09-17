@@ -9,7 +9,7 @@ env OPENSSL_VERSION;
 --- config
 location = /t { content_by_lua_block {
   local sm4 = require "resty.gmsm.sm4"
-  local text = sm4.OpenSSL_version
+  local text = sm4.Openssl_Version
   local seen = text:match("^OpenSSL%s+(%S+)") or "?"
   local want = os.getenv("OPENSSL_VERSION")
   ngx.say("SEEN: ", text)
