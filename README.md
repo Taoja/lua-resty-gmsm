@@ -1,10 +1,15 @@
 # lua-resty-gmsm
 
-基于OpenSSL3.6的国密实现
+基于OpenSSL的国密实现，以下环境已测试通过
+
+- [x] OpenSSL1.1.1w + OpenResty1.25.3.2
+- [x] OpenSSL3.0.22 + OpenResty1.25.3.2
+- [x] OpenSSL3.6.4 + OpenResty1.25.3.2
+- [x] OpenSSL4.0.2 + OpenResty1.31.1.1
 
 当前支持sm2、sm3、sm4
 
-其中sm4支持ecb、cbc、cfb、ofb、ctr、gcm，并且都只支持pkcs7补位
+其中sm4支持ecb、cbc、cfb、ofb、ctr、gcm（openssl3.6以上支持），并且都只支持pkcs7补位
 
 SM2 公钥、私钥和密文的外部输入输出统一使用ASN.1 der Base64 文本格式，密文固定使用C1C3C2格式。
 
