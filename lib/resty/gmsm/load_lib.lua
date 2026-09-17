@@ -1,4 +1,10 @@
-local ffi = require("ffi")
+local ffi = require "ffi"
+ffi.cdef[[
+  unsigned long OpenSSL_version_num(void);   /* >= 1.1.0 */
+  const char *OpenSSL_version(int type);
+  unsigned long SSLeay(void);                /* 1.0.x，1.1.0+ 仍作为兼容符号导出 */
+  const char *SSLeay_version(int type);
+]]
 
 local candidates = {
   Windows = {
@@ -28,6 +34,11 @@ local candidates = {
   }
 }
 
+local function has(t, name)
+  local ok, v = pcall(function() return t[name] end)
+  return (ok and v ~= nil) and v or nil
+end
+
 local function detect_os()
   if jit and jit.os then
     return jit.os
@@ -53,6 +64,10 @@ local function detect_os()
 end
 
 local function load_lib()
+  local dlib = has(ffi.C, "OpenSSL_version_num") or has(ffi.C, "SSLeay")
+  if dlib then
+    return ffi.C
+  end
   local os_name = detect_os()
   local names = candidates[os_name] or candidates.Linux
 
