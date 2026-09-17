@@ -58,6 +58,7 @@ int EVP_DigestVerifyInit(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
 int EVP_DigestVerifyUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt);
 int EVP_DigestVerifyFinal(EVP_MD_CTX *ctx, const unsigned char *sig, size_t siglen);
 const char *OpenSSL_version(int);
+void ERR_clear_error(void);
 ]]
 
 local NID_sm2 = ffi.cast("int", 1172)
@@ -90,6 +91,13 @@ local fn_new_from_name = try_symbol("EVP_PKEY_CTX_new_from_name")
 local fn_set_ec_curve = try_symbol("EVP_PKEY_CTX_set_ec_paramgen_curve_nid")
 local fn_set1_id = try_symbol("EVP_PKEY_CTX_set1_id")
 local fn_set_alias_type = try_symbol("EVP_PKEY_set_alias_type")
+local fn_clear_error = try_symbol("ERR_clear_error")
+
+local function clear_error()
+  if fn_clear_error ~= nil then
+    fn_clear_error()
+  end
+end
 
 --- 设置 SM2/EC 密钥生成使用的曲线
 --- 3.x 有导出函数；1.1.1 只有宏，按 EVP_PKEY_CTX_ctrl 手动展开
@@ -116,8 +124,45 @@ local function ctx_set1_id(ctx, id)
     return fn_set1_id(ctx, id, #id)
   end
 
+  -- 用显式 buffer 承载 id，避免直接把 Lua 字符串转成 void* 的生命周期风险
+  local id_buf = ffi.new("unsigned char[?]", #id + 1)
+  ffi.copy(id_buf, id, #id)
+
   return openssl.EVP_PKEY_CTX_ctrl(ctx, -1, -1,
-    EVP_PKEY_CTRL_SET1_ID, #id, ffi.cast("void *", id))
+    EVP_PKEY_CTRL_SET1_ID, #id, ffi.cast("void *", id_buf))
+end
+
+--- 带 sm2 id 的 DigestSign/Verify 初始化
+---
+--- 关键差异：1.1.1 的 do_sigver_init() 在 init 阶段就调用 pmeth->digest_custom
+--- （pkey_sm2_digest_custom），而它要求 sm2 id 已经设置，否则直接报
+--- SM2_R_ID_NOT_SET 并返回 0 —— 但此时 pctx 已经建好并回写给调用者。
+--- 所以 1.1.1 上的正确顺序是：先 init（必然失败）→ 在 pctx 上设置 id → 再 init 一次。
+--- 3.x 的 digest_custom 在 final 阶段才调用，第一次 init 就成功，不会走重试分支。
+---
+--- @param init_fn function EVP_DigestSignInit 或 EVP_DigestVerifyInit
+--- @param ctx EVP_MD_CTX*
+--- @param pctx EVP_PKEY_CTX*[1]
+--- @param pkey EVP_PKEY*
+--- @param id string sm2 id
+--- @return boolean 是否初始化成功
+local function digest_init_with_id(init_fn, ctx, pctx, pkey, id)
+  local ok = init_fn(ctx, pctx, openssl.EVP_sm3(), nil, pkey) > 0
+
+  if pctx[0] == ffi.NULL then
+    return false
+  end
+
+  if ctx_set1_id(pctx[0], id) <= 0 then
+    return false
+  end
+
+  if not ok then
+    clear_error()
+    ok = init_fn(ctx, pctx, openssl.EVP_sm3(), nil, pkey) > 0
+  end
+
+  return ok
 end
 
 --- 把 EC 类型的 key 别名成 SM2 类型
@@ -437,14 +482,10 @@ function _M:sign(data, id)
 
   local pctx = ffi.new("EVP_PKEY_CTX*[1]")
 
-  if openssl.EVP_DigestSignInit(ctx, pctx, openssl.EVP_sm3(), nil, self.key[0]) <= 0 then
+  if not digest_init_with_id(openssl.EVP_DigestSignInit, ctx, pctx,
+                             self.key[0], use_id) then
     openssl.EVP_MD_CTX_free(ctx)
     return nil, "EVP_DigestSignInit failed"
-  end
-
-  if ctx_set1_id(pctx[0], use_id) <= 0 then
-    openssl.EVP_MD_CTX_free(ctx)
-    return nil, "set sm2 id failed"
   end
 
   if openssl.EVP_DigestSignUpdate(ctx, data, #data) <= 0 then
@@ -488,14 +529,10 @@ function _M:verify(data, signature, id)
 
   local pctx = ffi.new("EVP_PKEY_CTX*[1]")
 
-  if openssl.EVP_DigestVerifyInit(ctx, pctx, openssl.EVP_sm3(), nil, self.key[0]) <= 0 then
+  if not digest_init_with_id(openssl.EVP_DigestVerifyInit, ctx, pctx,
+                             self.key[0], use_id) then
     openssl.EVP_MD_CTX_free(ctx)
     return false, "EVP_DigestVerifyInit failed"
-  end
-
-  if ctx_set1_id(pctx[0], use_id) <= 0 then
-    openssl.EVP_MD_CTX_free(ctx)
-    return false, "set sm2 id failed"
   end
 
   if openssl.EVP_DigestVerifyUpdate(ctx, data, #data) <= 0 then
