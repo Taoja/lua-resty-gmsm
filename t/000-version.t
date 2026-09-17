@@ -8,12 +8,8 @@ __DATA__
 env OPENSSL_VERSION;
 --- config
 location = /t { content_by_lua_block {
-  local ffi = require "ffi"
-  ffi.cdef[[const char *OpenSSL_version(int t);]]
-  local ok, lib = pcall(ffi.load, "crypto")
-  if not ok then ngx.say("RESULT: FAIL (ffi.load: ", tostring(lib), ")"); return end
-
-  local text = ffi.string(lib.OpenSSL_version(0))
+  local sm4 = require "resty.gmsm.sm4"
+  local text = sm4.OpenSSL_version
   local seen = text:match("^OpenSSL%s+(%S+)") or "?"
   local want = os.getenv("OPENSSL_VERSION")
   ngx.say("SEEN: ", text)
