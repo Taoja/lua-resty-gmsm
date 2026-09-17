@@ -4,8 +4,10 @@ run_tests();
 __DATA__
 
 === TEST 1: which openssl does Lua see
+--- http_config
+  lua_package_path "$prefix/lib/?.lua;$prefix/../../lib/?.lua;;";
 --- main_config
-env OPENSSL_VERSION;
+  env OPENSSL_VERSION;
 --- config
 location = /t { content_by_lua_block {
   local sm4 = require "resty.gmsm.sm4"
