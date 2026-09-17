@@ -15,7 +15,6 @@ typedef struct evp_cipher_st EVP_CIPHER;
 
 void EVP_PKEY_CTX_free(EVP_PKEY_CTX *ctx);
 int EVP_PKEY_keygen_init(EVP_PKEY_CTX *ctx);
-int EVP_PKEY_CTX_set_ec_paramgen_curve_nid(EVP_PKEY_CTX *ctx, int nid);
 int EVP_PKEY_keygen(EVP_PKEY_CTX *ctx, EVP_PKEY **ppkey);
 EVP_PKEY *d2i_PrivateKey(int type, EVP_PKEY **a, const unsigned char **pp,
     long length);
@@ -32,12 +31,20 @@ int EVP_PKEY_decrypt(EVP_PKEY_CTX *ctx,
     unsigned char *out, size_t *outlen,
     const unsigned char *in, size_t inlen);
 
+EVP_PKEY_CTX *EVP_PKEY_CTX_new_id(int id, ENGINE *e);
+EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e);
+int EVP_PKEY_CTX_ctrl(EVP_PKEY_CTX *ctx, int keytype, int optype,
+    int cmd, int p1, void *p2);
+int EVP_PKEY_set_alias_type(EVP_PKEY *pkey, int type);
+
+/* 以下两个在 3.x 是导出函数，在 1.1.1 只是宏（没有对应符号），
+ * 声明本身不会解析符号，实际调用前会做符号探测。 */
 EVP_PKEY_CTX *EVP_PKEY_CTX_new_from_name(OSSL_LIB_CTX *libctx,
     const char *name,
     const char *propquery);
+int EVP_PKEY_CTX_set_ec_paramgen_curve_nid(EVP_PKEY_CTX *ctx, int nid);
+int EVP_PKEY_CTX_set1_id(EVP_PKEY_CTX *ctx, const void *id, int len);
 int EVP_PKEY_paramgen_init(EVP_PKEY_CTX *ctx);
-
-EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, ENGINE *e);
 
 EVP_MD_CTX *EVP_MD_CTX_new(void);
 void EVP_MD_CTX_free(EVP_MD_CTX *ctx);
@@ -50,13 +57,83 @@ int EVP_DigestVerifyInit(EVP_MD_CTX *ctx, EVP_PKEY_CTX **pctx,
                          const EVP_MD *type, ENGINE *e, EVP_PKEY *pkey);
 int EVP_DigestVerifyUpdate(EVP_MD_CTX *ctx, const void *d, size_t cnt);
 int EVP_DigestVerifyFinal(EVP_MD_CTX *ctx, const unsigned char *sig, size_t siglen);
-int EVP_PKEY_CTX_set1_id(EVP_PKEY_CTX *ctx, const void *id, size_t id_len);
 const char *OpenSSL_version(int);
 ]]
 
 local NID_sm2 = ffi.cast("int", 1172)
 local EVP_PKEY_SM2 = NID_sm2
+local EVP_PKEY_EC = 408                        -- NID_X9_62_id_ecPublicKey
+local EVP_PKEY_ALG_CTRL = 0x1000
+-- 1.1.1 里这几个 ctrl 命令是宏：EVP_PKEY_ALG_CTRL + n（3.x 的 SET1_ID 另有取值，
+-- 但 3.x 提供了函数版本，所以下面的常量只会在 1.1.1 的 ctrl 分支里用到）
+local EVP_PKEY_CTRL_EC_PARAMGEN_CURVE_NID = EVP_PKEY_ALG_CTRL + 1
+local EVP_PKEY_CTRL_SET1_ID = EVP_PKEY_ALG_CTRL + 11
+local EVP_PKEY_OP_PARAMGEN = 2                 -- 1 << 1
+local EVP_PKEY_OP_KEYGEN = 4                   -- 1 << 2
+
 local openssl = load_lib()
+
+--- 探测符号是否存在：1.1.1 上访问 3.x 专有符号会直接抛 "undefined symbol"
+--- @param name string 符号名
+--- @return function? 可用则返回可调用对象，否则 nil
+local function try_symbol(name)
+  local ok, sym = pcall(function()
+    return openssl[name]
+  end)
+  if ok and sym ~= nil then
+    return sym
+  end
+  return nil
+end
+
+local fn_new_from_name = try_symbol("EVP_PKEY_CTX_new_from_name")
+local fn_set_ec_curve = try_symbol("EVP_PKEY_CTX_set_ec_paramgen_curve_nid")
+local fn_set1_id = try_symbol("EVP_PKEY_CTX_set1_id")
+local fn_set_alias_type = try_symbol("EVP_PKEY_set_alias_type")
+
+--- 设置 SM2/EC 密钥生成使用的曲线
+--- 3.x 有导出函数；1.1.1 只有宏，按 EVP_PKEY_CTX_ctrl 手动展开
+--- @param ctx EVP_PKEY_CTX*
+--- @param nid number 曲线 NID
+--- @return number 与 OpenSSL 一致的返回码（>0 成功）
+local function ctx_set_ec_curve(ctx, nid)
+  if fn_set_ec_curve ~= nil then
+    return fn_set_ec_curve(ctx, nid)
+  end
+
+  return openssl.EVP_PKEY_CTX_ctrl(ctx, EVP_PKEY_EC,
+    EVP_PKEY_OP_PARAMGEN + EVP_PKEY_OP_KEYGEN,
+    EVP_PKEY_CTRL_EC_PARAMGEN_CURVE_NID, nid, nil)
+end
+
+--- 设置 SM2 签名/验签用的 user id（Z 值计算用）
+--- 3.x 有导出函数；1.1.1 只有宏 EVP_PKEY_CTX_ctrl(ctx, -1, -1, ...)
+--- @param ctx EVP_PKEY_CTX*
+--- @param id string sm2 id
+--- @return number 与 OpenSSL 一致的返回码（>0 成功）
+local function ctx_set1_id(ctx, id)
+  if fn_set1_id ~= nil then
+    return fn_set1_id(ctx, id, #id)
+  end
+
+  return openssl.EVP_PKEY_CTX_ctrl(ctx, -1, -1,
+    EVP_PKEY_CTRL_SET1_ID, #id, ffi.cast("void *", id))
+end
+
+--- 把 EC 类型的 key 别名成 SM2 类型
+--- 1.1.1 下 d2i/EC keygen 得到的都是 EVP_PKEY_EC，EC 的 pmeth 既没有
+--- encrypt/decrypt 也不支持 SET1_ID，必须换成 SM2 的 pmeth 才能用；
+--- 3.x 下 d2i 解出来的已经是 SM2，set_alias_type 会直接返回 1。
+--- @param key EVP_PKEY*
+--- @return boolean 是否可用
+local function alias_to_sm2(key)
+  if key == ffi.NULL or fn_set_alias_type == nil then
+    -- 3.x 新版本已移除 set_alias_type，此时 d2i/gen 出来的本就是 SM2，无需转换
+    return true
+  end
+
+  return fn_set_alias_type(key, EVP_PKEY_SM2) > 0
+end
 
 local _M = {
   Version = '1.0.1',
@@ -126,10 +203,17 @@ function _M:import_private(data)
     key = openssl.d2i_PrivateKey(EVP_PKEY_SM2, nil, fallback_ptr, #normalized)
   end
 
-  self.key[0] = key
-  if self.key[0] == ffi.NULL then
+  if key == ffi.NULL then
     return "import private key error:" .. err()
   end
+
+  -- d2i 出来的是 EVP_PKEY_EC（id-ecPublicKey + sm2p256v1），
+  -- 1.1.1 下必须转成 SM2 才能加解密 / 设置 sm2 id
+  if not alias_to_sm2(key) then
+    return "import private key error: not an SM2 key"
+  end
+
+  self.key[0] = key
   return nil
 end
 
@@ -142,10 +226,15 @@ function _M:import_public(data)
   local input = ffi.cast("const unsigned char*", normalized)
   local input_ptr = ffi.new("const unsigned char*[1]", input)
   local key = openssl.d2i_PUBKEY(nil, input_ptr, #normalized)
-  self.key[0] = key
-  if self.key[0] == ffi.NULL then
+  if key == ffi.NULL then
     return "import publick key error:" .. err()
   end
+
+  if not alias_to_sm2(key) then
+    return "import public key error: not an SM2 key"
+  end
+
+  self.key[0] = key
   return nil
 end
 
@@ -163,27 +252,44 @@ end
 --- 生成sm2公私钥对
 --- @return string? 错误信息
 function _M:generate_key()
-  local genctx = openssl.EVP_PKEY_CTX_new_from_name(nil, "SM2", nil)
+  -- OpenSSL 3.x：SM2 keymgmt 支持 paramgen + keygen，走原路径
+  if fn_new_from_name ~= nil then
+    local genctx = fn_new_from_name(nil, "SM2", nil)
+    if genctx ~= nil then
+      local ok = openssl.EVP_PKEY_paramgen_init(genctx) > 0
+        and ctx_set_ec_curve(genctx, NID_sm2) > 0
+        and openssl.EVP_PKEY_keygen_init(genctx) > 0
+        and openssl.EVP_PKEY_keygen(genctx, self.key) > 0
+
+      openssl.EVP_PKEY_CTX_free(genctx)
+      if ok then
+        return nil
+      end
+    end
+  end
+
+  -- OpenSSL 1.1.1（以及上面的兜底）：sm2_pkey_meth 里 keygen/paramgen 都是 NULL，
+  -- EVP_PKEY_keygen_init 会直接返回 -2（unsupported），
+  -- 所以按 sm2p256v1 曲线用 EC 的 keygen 生成，再 alias 成 SM2
+  local genctx = openssl.EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nil)
   if genctx == nil then
     return "generate key fail:" .. err()
   end
 
-  if openssl.EVP_PKEY_paramgen_init(genctx) <= 0 then
-    return "generate key fail:" .. err()
-  end
+  local ok = openssl.EVP_PKEY_keygen_init(genctx) > 0
+    and ctx_set_ec_curve(genctx, NID_sm2) > 0
+    and openssl.EVP_PKEY_keygen(genctx, self.key) > 0
 
-  if openssl.EVP_PKEY_CTX_set_ec_paramgen_curve_nid(genctx, NID_sm2) <= 0 then
-    return "generate key fail:" .. err()
-  end
-
-  if openssl.EVP_PKEY_keygen_init(genctx) <= 0 then
-    return "generate key fail:" .. err()
-  end
-
-  if openssl.EVP_PKEY_keygen(genctx, self.key) <= 0 then
-    return "generate key fail:" .. err()
-  end
   openssl.EVP_PKEY_CTX_free(genctx)
+
+  if not ok or self.key[0] == ffi.NULL then
+    return "generate key fail:" .. err()
+  end
+
+  if not alias_to_sm2(self.key[0]) then
+    return "generate key fail: cannot convert EC key to SM2"
+  end
+
   return nil
 end
 
@@ -323,7 +429,6 @@ function _M:sign(data, id)
   end
 
   local use_id = id or self.sm2_id
-  local id_len = #use_id
 
   local ctx = openssl.EVP_MD_CTX_new()
   if ctx == nil then
@@ -337,9 +442,9 @@ function _M:sign(data, id)
     return nil, "EVP_DigestSignInit failed"
   end
 
-  if openssl.EVP_PKEY_CTX_set1_id(pctx[0], use_id, id_len) <= 0 then
+  if ctx_set1_id(pctx[0], use_id) <= 0 then
     openssl.EVP_MD_CTX_free(ctx)
-    return nil, "EVP_PKEY_CTX_set1_id failed"
+    return nil, "set sm2 id failed"
   end
 
   if openssl.EVP_DigestSignUpdate(ctx, data, #data) <= 0 then
@@ -373,9 +478,8 @@ function _M:verify(data, signature, id)
   if self.key[0] == ffi.NULL then
     return nil, "no key loaded"
   end
-  
+
   local use_id = id or self.sm2_id
-  local id_len = #use_id
 
   local ctx = openssl.EVP_MD_CTX_new()
   if ctx == nil then
@@ -389,9 +493,9 @@ function _M:verify(data, signature, id)
     return false, "EVP_DigestVerifyInit failed"
   end
 
-  if openssl.EVP_PKEY_CTX_set1_id(pctx[0], use_id, id_len) <= 0 then
+  if ctx_set1_id(pctx[0], use_id) <= 0 then
     openssl.EVP_MD_CTX_free(ctx)
-    return false, "EVP_PKEY_CTX_set1_id failed"
+    return false, "set sm2 id failed"
   end
 
   if openssl.EVP_DigestVerifyUpdate(ctx, data, #data) <= 0 then
