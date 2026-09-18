@@ -134,7 +134,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:\opt\openssl-${{ matrix.ssl }}
-          key: win-ssl-${{ matrix.ssl }}-shared-v2
+          key: win-ssl-${{ matrix.ssl }}-shared-v3
 
       - name: Build shared OpenSSL
         id: build-ssl
@@ -170,11 +170,25 @@ jobs:
           # mingw64 是 OpenSSL 官方支持的 MinGW-w64 target，1.1.1 / 3.x / 4.x 同名
           # no-asm：省掉 nasm 依赖，CI 里不差这点性能，但能避开 nasm 版本坑
           # 注意：Linux 版的 '-Wl,-rpath,$(LIBRPATH)' 在 Windows 上无效，已去掉
-          ./Configure mingw64 \
-            --prefix="$SSL_DIR" \
-            --openssldir="$SSL_DIR/ssl" \
-            shared \
-            no-asm
+          # 关键：3.x/4.x 在 mingw64 下默认把库装进 lib64/，必须显式 --libdir=lib
+          # 1.1.1 不认识 --libdir，所以按版本分开
+          case "$OPENSSL_VERSION" in
+            1.*)
+              ./Configure mingw64 \
+                --prefix="$SSL_DIR" \
+                --openssldir="$SSL_DIR/ssl" \
+                shared \
+                no-asm
+              ;;
+            *)
+              ./Configure mingw64 \
+                --prefix="$SSL_DIR" \
+                --openssldir="$SSL_DIR/ssl" \
+                --libdir=lib \
+                shared \
+                no-asm
+              ;;
+          esac
 
           make -j"$(nproc)"
 
@@ -189,21 +203,36 @@ jobs:
           make install_ssldirs || echo "::warning::install_ssldirs 不可用（1.1.1 无此目标）"
 
           # ---- 归一化导入库位置 ----
-          # MinGW 的导入库 libcrypto.dll.a / libssl.dll.a 落在哪，随 OpenSSL 大版本
-          # 和安装目标而变：1.1.1 在 lib/，3.x 常见在 bin/（与 DLL 同目录）。
-          # 下游只认 -L$SSL_DIR/lib，所以这里统一镜像到 lib/。
+          # MinGW 的导入库 libcrypto.dll.a / libssl.dll.a 落点随大版本而变：
+          # 1.1.1 → lib/，3.x/4.x → lib64/（已用 --libdir=lib 修正）或 bin/。
+          # 用 if + [ -f ] 逐个探测，不用 ls 多路径匹配——GNU ls 遇到不存在的路径
+          # 会 exit 2，配合 set -e 会直接把整个 step 打死。
           mkdir -p "$SSL_DIR/lib"
           for n in libcrypto libssl; do
-            found="$(ls "$SSL_DIR"/lib/$n.dll.a "$SSL_DIR"/bin/$n.dll.a \
-                       "$SSL_DIR"/lib64/$n.dll.a 2>/dev/null | head -1)"
-            [ -n "$found" ] || {
-              echo "::error::未找到 $n 的导入库（.dll.a）"
-              find "$SSL_DIR" -name "$n*" -print
+            src=""
+            for cand in \
+              "$SSL_DIR/lib/$n.dll.a" \
+              "$SSL_DIR/bin/$n.dll.a" \
+              "$SSL_DIR/lib64/$n.dll.a"
+            do
+              if [ -f "$cand" ]; then src="$cand"; break; fi
+            done
+            if [ -z "$src" ]; then
+              src="$(find "$SSL_DIR" -name "$n.dll.a" -print -quit 2>/dev/null || true)"
+            fi
+            if [ -z "$src" ]; then
+              echo "::error::整个 prefix 下都找不到 $n.dll.a（导入库）"
+              find "$SSL_DIR" -maxdepth 3 -name "$n*" -print || true
               exit 1
-            }
-            [ -f "$SSL_DIR/lib/$n.dll.a" ] || cp "$found" "$SSL_DIR/lib/$n.dll.a"
-            echo "$n 导入库 <- $found"
+            fi
+            # lib/ 可能是 lib64 的符号链接，此时源和目标同一文件，cmp 判定后跳过
+            if [ ! -f "$SSL_DIR/lib/$n.dll.a" ] || ! cmp -s "$src" "$SSL_DIR/lib/$n.dll.a"; then
+              cp -fL "$src" "$SSL_DIR/lib/$n.dll.a"
+            fi
+            echo "$n 导入库 <- $src -> $SSL_DIR/lib/$n.dll.a"
           done
+          # lib64 是 lib 的副本/符号链接，留着只会让 -L 混乱，清掉
+          rm -rf "$SSL_DIR/lib64"
 
           # ---- 瘦身 ----
           # .dll.a 是导入库，OpenResty 链接要用，绝不能删；只删真静态库 libcrypto.a/libssl.a
@@ -217,7 +246,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\opt\openssl-${{ matrix.ssl }}
-          key: win-ssl-${{ matrix.ssl }}-shared-v2
+          key: win-ssl-${{ matrix.ssl }}-shared-v3
 
       - name: Assert OpenSSL build
         run: |
@@ -231,10 +260,23 @@ jobs:
           # 便于一眼看出是缓存问题而不是链接问题
           ls -l "$SSL_DIR/lib/libcrypto.dll.a" "$SSL_DIR/lib/libssl.dll.a"
           ls -l "$SSL_DIR/include/openssl/opensslv.h"
-          # 链接期实测：能编出一个真用到 libcrypto 的可执行文件才算数
+          # 链接期实测：能编出可执行文件才算数。
+          # MinGW 下链接 OpenSSL 有时还需要一批系统库（OpenSSL 官方 NOTES-WINDOWS
+          # 明确要求静态链接时补 WS2_32/GDI32/ADVAPI32/CRYPT32/USER32），
+          # 先按"干净"方式试，失败再补系统库重试，并把结果写给 OpenResty 那步复用。
           printf 'int main(void){return 0;}\n' > /tmp/t.c
-          gcc -o /tmp/t.exe /tmp/t.c -I"$SSL_DIR/include" -L"$SSL_DIR/lib" -lssl -lcrypto \
-            || { echo "::error::无法链接 OpenSSL"; ls -lR "$SSL_DIR/lib"; exit 1; }
+          if gcc -o /tmp/t.exe /tmp/t.c -I"$SSL_DIR/include" -L"$SSL_DIR/lib" -lssl -lcrypto; then
+            echo "链接方式：仅 -lssl -lcrypto"
+            echo "SSL_EXTRA_LIBS=" >> "$GITHUB_ENV"
+          elif gcc -o /tmp/t.exe /tmp/t.c -I"$SSL_DIR/include" -L"$SSL_DIR/lib" \
+                 -lssl -lcrypto -lws2_32 -lgdi32 -ladvapi32 -lcrypt32 -luser32; then
+            echo "链接方式：需要补系统库"
+            echo "SSL_EXTRA_LIBS=-lws2_32 -lgdi32 -ladvapi32 -lcrypt32 -luser32" >> "$GITHUB_ENV"
+          else
+            echo "::error::无法链接 OpenSSL"
+            ls -l "$SSL_DIR/lib"; find "$SSL_DIR" -name '*.dll.a' -print || true
+            exit 1
+          fi
 
       # ================= LuaJIT（必须先于 OpenResty configure）=================
       # 不能让 OpenResty 自己构建 LuaJIT：luajit2 的 src/Makefile 在 HOST_SYS=Windows
@@ -374,7 +416,7 @@ jobs:
             --prefix="$OR_DIR" \
             --sbin-path=nginx.exe \
             --with-cc-opt="-DFD_SETSIZE=1024 -I$SSL_DIR/include" \
-            --with-ld-opt="-L$SSL_DIR/lib -lssl -lcrypto" \
+            --with-ld-opt="-L$SSL_DIR/lib -lssl -lcrypto ${SSL_EXTRA_LIBS}" \
             $PCRE_OPT \
             $PCRE_JIT \
             --with-zlib="$PWD/objs/lib/zlib-${ZLIB_VERSION}" \
