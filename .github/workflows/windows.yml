@@ -16,7 +16,15 @@
 #     官方 util/build-win32.sh 也是这条路，且必须用
 #     --with-cc=gcc / --sbin-path=nginx.exe / -DFD_SETSIZE=1024 / --with-select_module。
 #
-#  4. 路径有两套：MSYS2 视角 /c/opt/... 与 Windows 视角 C:\opt\...
+#  4. 不能让 OpenResty 自己编译它自带的 luajit2：
+#     luajit2 的 src/Makefile 在 HOST_SYS=Windows 时把 GIT_RELVER 写成 cmd.exe 语法
+#     （if exist ..\.git ( git show ... ) else ( type ... )），而 MSYS2 的 make 用 sh
+#     执行配方 → 语法错误 → luajit.h 生成不出来 → luajit-root 是空的 →
+#     configure 报 "ngx_http_lua_module requires the LuaJIT library ... not found"。
+#     本 workflow 改为手工从 bundle/LuaJIT-2.1-*/src 构建（覆盖 GIT_RELVER），
+#     再用 --with-luajit=DIR 交给 OpenResty。
+#
+#  5. 路径有两套：MSYS2 视角 /c/opt/... 与 Windows 视角 C:\opt\...
 #     configure 用 MSYS 路径（make install 才会真正落到 C:），
 #     运行时 nginx -p 用 cygpath 转出来的 Windows 路径。
 # ============================================================================
@@ -82,6 +90,7 @@ jobs:
       # MSYS2 视角：configure / make install 用
       SSL_DIR: "/c/opt/openssl-${{ matrix.ssl }}"
       OR_DIR:  "/c/opt/openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}"
+      LJ_DIR:  "/c/opt/luajit-${{ matrix.or }}"
       # Windows 视角：actions/cache / nginx -p 用（env context 不能用于 with，故缓存 path 直接写字面量）
       SSL_DIR_WIN: 'C:\opt\openssl-${{ matrix.ssl }}'
       OR_DIR_WIN:  'C:\opt\openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}'
@@ -125,7 +134,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:\opt\openssl-${{ matrix.ssl }}
-          key: win-ssl-${{ matrix.ssl }}-shared
+          key: win-ssl-${{ matrix.ssl }}-shared-v2
 
       - name: Build shared OpenSSL
         id: build-ssl
@@ -169,14 +178,34 @@ jobs:
 
           make -j"$(nproc)"
 
-          # 1.1.1 没有 install_ssldirs 目标
-          if ! make install_sw install_ssldirs; then
-            echo "::warning::install_ssldirs 不可用，退回 install_sw"
-            make install_sw
-          fi
+          # 三个目标分开跑、各自容错：
+          #   install_sw     —— 运行时（openssl.exe + DLL）
+          #   install_dev    —— 开发件（头文件 + .a + 导入库 .dll.a）
+          #   install_ssldirs—— 证书/配置目录（1.1.1 无此目标）
+          # 1.1.1 与 3.x 对"哪些文件算 sw、哪些算 dev"的划分不一致，
+          # 只跑 install_sw 在 3.x 上会漏掉 libcrypto.dll.a。
+          make install_sw
+          make install_dev    || echo "::warning::install_dev 不可用"
+          make install_ssldirs || echo "::warning::install_ssldirs 不可用（1.1.1 无此目标）"
+
+          # ---- 归一化导入库位置 ----
+          # MinGW 的导入库 libcrypto.dll.a / libssl.dll.a 落在哪，随 OpenSSL 大版本
+          # 和安装目标而变：1.1.1 在 lib/，3.x 常见在 bin/（与 DLL 同目录）。
+          # 下游只认 -L$SSL_DIR/lib，所以这里统一镜像到 lib/。
+          mkdir -p "$SSL_DIR/lib"
+          for n in libcrypto libssl; do
+            found="$(ls "$SSL_DIR"/lib/$n.dll.a "$SSL_DIR"/bin/$n.dll.a \
+                       "$SSL_DIR"/lib64/$n.dll.a 2>/dev/null | head -1)"
+            [ -n "$found" ] || {
+              echo "::error::未找到 $n 的导入库（.dll.a）"
+              find "$SSL_DIR" -name "$n*" -print
+              exit 1
+            }
+            [ -f "$SSL_DIR/lib/$n.dll.a" ] || cp "$found" "$SSL_DIR/lib/$n.dll.a"
+            echo "$n 导入库 <- $found"
+          done
 
           # ---- 瘦身 ----
-          # MinGW 下 *.dll 在 bin/，*.dll.a 在 lib/。
           # .dll.a 是导入库，OpenResty 链接要用，绝不能删；只删真静态库 libcrypto.a/libssl.a
           rm -rf "$SSL_DIR/share" "$SSL_DIR/html" "$SSL_DIR/lib/pkgconfig"
           rm -f "$SSL_DIR/lib/libcrypto.a" "$SSL_DIR/lib/libssl.a"
@@ -188,7 +217,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\opt\openssl-${{ matrix.ssl }}
-          key: win-ssl-${{ matrix.ssl }}-shared
+          key: win-ssl-${{ matrix.ssl }}-shared-v2
 
       - name: Assert OpenSSL build
         run: |
@@ -198,8 +227,98 @@ jobs:
           # nginx 走 libssl/libcrypto，不受影响
           ls -l "$SSL_DIR"/bin/libcrypto*.dll
           ls -l "$SSL_DIR"/bin/libssl*.dll
-          ls -l "$SSL_DIR"/lib/libcrypto.dll.a
+          # 导入库必须存在（构建步骤已归一化到 lib/）；命中旧缓存时这里会先炸，
+          # 便于一眼看出是缓存问题而不是链接问题
+          ls -l "$SSL_DIR/lib/libcrypto.dll.a" "$SSL_DIR/lib/libssl.dll.a"
           ls -l "$SSL_DIR/include/openssl/opensslv.h"
+          # 链接期实测：能编出一个真用到 libcrypto 的可执行文件才算数
+          printf 'int main(void){return 0;}\n' > /tmp/t.c
+          gcc -o /tmp/t.exe /tmp/t.c -I"$SSL_DIR/include" -L"$SSL_DIR/lib" -lssl -lcrypto \
+            || { echo "::error::无法链接 OpenSSL"; ls -lR "$SSL_DIR/lib"; exit 1; }
+
+      # ================= LuaJIT（必须先于 OpenResty configure）=================
+      # 不能让 OpenResty 自己构建 LuaJIT：luajit2 的 src/Makefile 在 HOST_SYS=Windows
+      # 时把 GIT_RELVER 定义成 cmd.exe 语法（if exist ..\.git ( git show ... ) else ( ... )），
+      # 而 MSYS2 的 make 用 sh 执行配方 → "syntax error near unexpected token '('"
+      # → luajit.h 生成不出来 → luajit-root 为空 → configure 报 "requires the LuaJIT library"。
+      # 解决办法：自己从 bundle/ 里构建 luajit2，再从命令行覆盖 GIT_RELVER，
+      # 最后用 --with-luajit=DIR 交给 OpenResty，绕开它内部那段构建。
+      - name: Prepare OpenResty source + deps
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/or-build
+          cd /tmp/or-build
+          if [ ! -d "openresty-${OPENRESTY_VERSION}" ]; then
+            curl -fL --retry 3 --retry-delay 5 --max-time 300 \
+              "https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz" \
+              -o openresty.tar.gz
+            tar -xzf openresty.tar.gz
+          fi
+          cd "openresty-${OPENRESTY_VERSION}"
+
+          # Windows 下必须自带 pcre2 / zlib 源码：nginx 的 auto/lib 探测
+          # 在 MinGW 下找不到 MSYS2 的 /mingw64/{include,lib}
+          mkdir -p objs/lib
+          cd objs/lib
+          if [ ! -d "pcre2-${PCRE2_VERSION}" ]; then
+            curl -fL --retry 3 --max-time 300 \
+              "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz" \
+              -o pcre2.tar.gz
+            tar -xzf pcre2.tar.gz
+          fi
+          if [ ! -d "zlib-${ZLIB_VERSION}" ]; then
+            curl -fL --retry 3 --max-time 300 \
+              "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz" \
+              -o zlib.tar.gz
+            tar -xzf zlib.tar.gz
+          fi
+          cd ../..
+          ls -d bundle/LuaJIT-2.1-*
+
+      - name: Restore LuaJIT
+        id: lj-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\opt\luajit-${{ matrix.or }}
+          key: win-luajit-${{ matrix.or }}
+
+      - name: Build LuaJIT (MinGW, static)
+        id: build-lj
+        if: steps.lj-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cd "/tmp/or-build/openresty-${OPENRESTY_VERSION}"
+          LJSRC="$(ls -d bundle/LuaJIT-2.1-* | head -1)"
+          [ -n "$LJSRC" ] || { echo "::error::bundle 里没有 LuaJIT 源码"; ls -l bundle; exit 1; }
+          cd "$LJSRC/src"
+
+          # LuaJIT 的 Makefile 明确不支持并行（内部依赖关系靠顺序保证），必须 -j1
+          # 顶层 Makefile 写着 "NOT useful for Windows"，MinGW 要在 src/ 下 make
+          # GIT_RELVER 覆盖成 POSIX 写法：这是 Windows/MinGW 下这一行的官方绕过方式
+          make -j1 \
+            CC=gcc HOST_CC=gcc \
+            TARGET_SYS=Windows \
+            BUILDMODE=static \
+            XCFLAGS="-DLUAJIT_NUMMODE=2 -DLUAJIT_ENABLE_LUA52COMPAT" \
+            GIT_RELVER='(cat ../.relver 2>/dev/null || cat ../../.relver 2>/dev/null || echo 0) >luajit_relver.txt' \
+            2>&1 | tee /tmp/luajit-build.log
+
+          # ---- 手工"安装"（Windows 没有 make install）----
+          mkdir -p "$LJ_DIR/bin" "$LJ_DIR/lib" "$LJ_DIR/include/luajit-2.1" "$LJ_DIR/share/lua/5.1"
+          cp luajit.exe "$LJ_DIR/bin/"
+          cp libluajit*.a "$LJ_DIR/lib/"
+          cp lua.h lualib.h lauxlib.h luaconf.h luajit.h "$LJ_DIR/include/luajit-2.1/"
+          cp -r jit "$LJ_DIR/share/lua/5.1/"
+          ls -l "$LJ_DIR/lib/" "$LJ_DIR/include/luajit-2.1/"
+          # 必须有 .a：OpenResty 用 -lluajit-5.1 链接
+          ls "$LJ_DIR/lib/libluajit-5.1.a"
+
+      - name: Save LuaJIT
+        if: always() && steps.build-lj.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\opt\luajit-${{ matrix.or }}
+          key: win-luajit-${{ matrix.or }}
 
       # ================= OpenResty =================
       - name: Restore OpenResty
@@ -213,29 +332,18 @@ jobs:
         id: build-or
         if: steps.or-cache.outputs.cache-hit != 'true'
         run: |
-          set -eux
+          set -euxo pipefail
           mkdir -p /tmp/or-build
           cd /tmp/or-build
 
-          curl -fL --retry 3 --retry-delay 5 --max-time 300 \
-            "https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz" \
-            -o openresty.tar.gz
-          tar -xzf openresty.tar.gz
+          # 源码与 pcre2/zlib 已由上一个 step 准备好；缓存命中 Perl/OR 但源码被清时兜底
+          if [ ! -d "openresty-${OPENRESTY_VERSION}" ]; then
+            curl -fL --retry 3 --retry-delay 5 --max-time 300 \
+              "https://openresty.org/download/openresty-${OPENRESTY_VERSION}.tar.gz" \
+              -o openresty.tar.gz
+            tar -xzf openresty.tar.gz
+          fi
           cd "openresty-${OPENRESTY_VERSION}"
-
-          # Windows 下必须自带 pcre2 / zlib 源码：nginx 的 auto/lib 探测
-          # 在 MinGW 下找不到 MSYS2 的 /mingw64/{include,lib}
-          mkdir -p objs/lib
-          cd objs/lib
-          curl -fL --retry 3 --max-time 300 \
-            "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz" \
-            -o pcre2.tar.gz
-          tar -xzf pcre2.tar.gz
-          curl -fL --retry 3 --max-time 300 \
-            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz" \
-            -o zlib.tar.gz
-          tar -xzf zlib.tar.gz
-          cd ../..
 
           # 1.25 系只有 --with-pcre=，1.27+ 才有 --with-pcre2=，先探测再决定
           PCRE_OPT=""
@@ -256,6 +364,11 @@ jobs:
           # 不用 --with-openssl（静态链接，FFI 够不着）；
           # 用 -I / -L 指向已安装的 DLL + 导入库。
           # Windows 没有 rpath，链接期靠 -L 找 .dll.a，运行期靠下一行的 DLL 拷贝。
+          # lua-cjson / lua-rds-parser 的 Makefile 在 MinGW 下链接 luajit 会踩坑，
+          # 官方 build-win32.sh 也是直接关掉 rds 系列，这里照抄
+          export LUAJIT_LIB="$LJ_DIR/lib"
+          export LUAJIT_INC="$LJ_DIR/include/luajit-2.1"
+
           ./configure \
             --with-cc=gcc \
             --prefix="$OR_DIR" \
@@ -265,15 +378,16 @@ jobs:
             $PCRE_OPT \
             $PCRE_JIT \
             --with-zlib="$PWD/objs/lib/zlib-${ZLIB_VERSION}" \
+            --with-luajit="$LJ_DIR" \
             --with-http_ssl_module \
             --with-http_v2_module \
             --with-http_realip_module \
-            --with-luajit \
-            --with-luajit-xcflags="-DLUAJIT_NUMMODE=2 -DLUAJIT_ENABLE_LUA52COMPAT" \
             --with-stream \
             --with-stream_ssl_module \
             --with-select_module \
-            -j"$(nproc)"
+            --without-http_rds_json_module \
+            --without-http_rds_csv_module \
+            --without-lua_rds_parser
 
           make -j"$(nproc)"
           make install
