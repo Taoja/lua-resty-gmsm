@@ -96,6 +96,7 @@ jobs:
       OR_DIR_WIN:  'C:\opt\openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}'
       ZLIB_VERSION:  "1.3.1"
       PCRE2_VERSION: "10.44"
+      PCRE1_VERSION: "8.45"
 
     steps:
       - uses: actions/checkout@v4
@@ -298,16 +299,10 @@ jobs:
           fi
           cd "openresty-${OPENRESTY_VERSION}"
 
-          # Windows 下必须自带 pcre2 / zlib 源码：nginx 的 auto/lib 探测
+          # Windows 下必须自带 pcre / zlib 源码：nginx 的 auto/lib 探测
           # 在 MinGW 下找不到 MSYS2 的 /mingw64/{include,lib}
           mkdir -p objs/lib
           cd objs/lib
-          if [ ! -d "pcre2-${PCRE2_VERSION}" ]; then
-            curl -fL --retry 3 --max-time 300 \
-              "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz" \
-              -o pcre2.tar.gz
-            tar -xzf pcre2.tar.gz
-          fi
           if [ ! -d "zlib-${ZLIB_VERSION}" ]; then
             curl -fL --retry 3 --max-time 300 \
               "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz" \
@@ -315,6 +310,50 @@ jobs:
             tar -xzf zlib.tar.gz
           fi
           cd ../..
+
+          # ---- 关键：PCRE1 还是 PCRE2，取决于这个 OpenResty 支持哪个 ----
+          # 实测 1.25.3.2：--with-pcre=DIR 会被翻译成 nginx 的
+          #   --with-pcre=DIR  --without-pcre2
+          # 也就是说 --with-pcre= 在这套 configure 里语义是「PCRE1 源码目录」。
+          # 若把 pcre2 源码塞给 --with-pcre=，configure 能过，但 make 阶段
+          # nginx 会按 PCRE1 的方式去编译它（找 pcre.h、libpcre.a），必然炸。
+          # 所以这里先看 configure 认不认 --with-pcre2，再决定下载哪一套。
+          if grep -q -- '--with-pcre2' ./configure; then
+            PCRE_FLAVOR="pcre2"
+            PCRE_DIRNAME="pcre2-${PCRE2_VERSION}"
+          else
+            PCRE_FLAVOR="pcre1"
+            PCRE_DIRNAME="pcre-${PCRE1_VERSION}"
+          fi
+          echo "PCRE_FLAVOR=$PCRE_FLAVOR"
+
+          cd objs/lib
+          if [ ! -d "$PCRE_DIRNAME" ]; then
+            case "$PCRE_FLAVOR" in
+              pcre2)
+                set -- \
+                  "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz"
+                ;;
+              *)
+                set -- \
+                  "https://sourceforge.net/projects/pcre/files/pcre/${PCRE1_VERSION}/pcre-${PCRE1_VERSION}.tar.gz/download" \
+                  "https://github.com/PCRE2Project/pcre/releases/download/pcre-${PCRE1_VERSION}/pcre-${PCRE1_VERSION}.tar.gz"
+                ;;
+            esac
+            ok=0
+            for url in "$@"; do
+              if curl -fL --retry 3 --retry-delay 5 --max-time 300 "$url" -o pcre.tar.gz; then
+                ok=1; break
+              fi
+            done
+            [ "$ok" = 1 ] || { echo "::error::${PCRE_FLAVOR} 源码下载失败"; exit 1; }
+            tar -xzf pcre.tar.gz
+          fi
+          cd ../..
+          ls -d "objs/lib/$PCRE_DIRNAME"
+          # 给后续 step 用
+          echo "PCRE_FLAVOR=$PCRE_FLAVOR" > /tmp/pcre.env
+          echo "PCRE_DIRNAME=$PCRE_DIRNAME" >> /tmp/pcre.env
           ls -d bundle/LuaJIT-2.1-*
 
       - name: Restore LuaJIT
@@ -322,7 +361,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:\opt\luajit-${{ matrix.or }}
-          key: win-luajit-${{ matrix.or }}-v2
+          key: win-luajit-${{ matrix.or }}-v3
 
       - name: Build LuaJIT (MinGW, static)
         id: build-lj
@@ -369,9 +408,26 @@ jobs:
             echo "已生成 $LJ_DIR/lib/libluajit-5.1.a <- $src"
           fi
 
+          # ---- 关键：Windows 上 ngx_lua 找的是 -llua51，不是 -lluajit-5.1 ----
+          # lua-nginx-module 的 config 里写死了：
+          #   if [ "$NGX_PLATFORM" = win32 ]; then
+          #       # LuaJIT's win32 build uses the library file name lua51.dll
+          #       ngx_feature_libs="$ngx_lua_opt_L -llua51"
+          # 只有非 win32 分支才用 -lluajit-5.1。
+          # 所以必须再补一个 liblua51.a（同一份静态库的副本），否则
+          # "checking for LuaJIT library ... (win32) ... not found"。
+          # 三个名字都放齐，覆盖不同版本/分支的查找方式：
+          #   libluajit.a       —— make 的原始产物
+          #   libluajit-5.1.a   —— POSIX 分支（也是标准安装名）
+          #   liblua51.a        —— win32 分支
+          if [ ! -f "$LJ_DIR/lib/liblua51.a" ]; then
+            cp -f "$LJ_DIR/lib/libluajit-5.1.a" "$LJ_DIR/lib/liblua51.a"
+            echo "已生成 $LJ_DIR/lib/liblua51.a"
+          fi
+
           ls -l "$LJ_DIR/lib/" "$LJ_DIR/include/luajit-2.1/"
-          # 断言：OpenResty 用 -lluajit-5.1 链接，这个文件必须存在
-          ls "$LJ_DIR/lib/libluajit-5.1.a"
+          # 断言：三个名字都必须存在
+          ls "$LJ_DIR/lib/libluajit.a" "$LJ_DIR/lib/libluajit-5.1.a" "$LJ_DIR/lib/liblua51.a"
           # 断言：luajit.exe 能跑起来。jit.* 模块只做告警——即便它没找到，
           # 也不影响 nginx（OpenResty 用自己的 lualib/jit，且 --with-luajit= 只取 lib/include）
           "$LJ_DIR/bin/luajit.exe" -e 'print("luajit ok")'
@@ -383,7 +439,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\opt\luajit-${{ matrix.or }}
-          key: win-luajit-${{ matrix.or }}-v2
+          key: win-luajit-${{ matrix.or }}-v3
 
       # ================= OpenResty =================
       - name: Restore OpenResty
@@ -391,7 +447,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:\opt\openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}
-          key: win-or-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared
+          key: win-or-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared-v2
 
       - name: Build OpenResty
         id: build-or
@@ -410,21 +466,40 @@ jobs:
           fi
           cd "openresty-${OPENRESTY_VERSION}"
 
-          # 1.25 系只有 --with-pcre=，1.27+ 才有 --with-pcre2=，先探测再决定
-          PCRE_OPT=""
-          PCRE_JIT=""
-          if ./configure --help 2>&1 | grep -q -- '--with-pcre2='; then
-            PCRE_OPT="--with-pcre2=$PWD/objs/lib/pcre2-${PCRE2_VERSION}"
-            if ./configure --help 2>&1 | grep -q -- '--with-pcre2-jit'; then
-              PCRE_JIT="--with-pcre2-jit"
-            fi
-          elif ./configure --help 2>&1 | grep -q -- '--with-pcre='; then
-            PCRE_OPT="--with-pcre=$PWD/objs/lib/pcre2-${PCRE2_VERSION}"
-            if ./configure --help 2>&1 | grep -q -- '--with-pcre-jit'; then
-              PCRE_JIT="--with-pcre-jit"
-            fi
+          # PCRE1 / PCRE2 的选择沿用"Prepare"步骤的结论；
+          # 若那一步没落盘（例如缓存命中后重跑），这里按同样规则重算
+          if [ -f /tmp/pcre.env ]; then
+            . /tmp/pcre.env
+          elif grep -q -- '--with-pcre2' ./configure; then
+            PCRE_FLAVOR=pcre2;  PCRE_DIRNAME="pcre2-${PCRE2_VERSION}"
+          else
+            PCRE_FLAVOR=pcre1;  PCRE_DIRNAME="pcre-${PCRE1_VERSION}"
           fi
-          echo "PCRE_OPT=$PCRE_OPT PCRE_JIT=$PCRE_JIT"
+          PCRE_DIR="$PWD/objs/lib/$PCRE_DIRNAME"
+          [ -d "$PCRE_DIR" ] || { echo "::error::缺少 PCRE 源码目录 $PCRE_DIR"; ls -l objs/lib; exit 1; }
+
+          case "$PCRE_FLAVOR" in
+            pcre2)
+              PCRE_OPT="--with-pcre2=$PCRE_DIR"
+              # JIT 开关名字随版本变，先探测
+              if grep -q -- '--with-pcre2-jit' ./configure; then
+                PCRE_JIT="--with-pcre2-jit"
+              elif grep -q -- '--with-pcre-jit' ./configure; then
+                PCRE_JIT="--with-pcre-jit"
+              else
+                PCRE_JIT=""
+              fi
+              ;;
+            *)
+              PCRE_OPT="--with-pcre=$PCRE_DIR"
+              if grep -q -- '--with-pcre-jit' ./configure; then
+                PCRE_JIT="--with-pcre-jit"
+              else
+                PCRE_JIT=""
+              fi
+              ;;
+          esac
+          echo "PCRE_FLAVOR=$PCRE_FLAVOR PCRE_OPT=$PCRE_OPT PCRE_JIT=$PCRE_JIT"
 
           # 不用 --with-openssl（静态链接，FFI 够不着）；
           # 用 -I / -L 指向已安装的 DLL + 导入库。
@@ -479,7 +554,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\opt\openresty-${{ matrix.or }}-ssl${{ matrix.ssl }}
-          key: win-or-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared
+          key: win-or-${{ matrix.or }}-ssl${{ matrix.ssl }}-shared-v2
 
       - name: Assert OpenResty linkage
         run: |
