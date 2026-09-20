@@ -322,7 +322,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: C:\opt\luajit-${{ matrix.or }}
-          key: win-luajit-${{ matrix.or }}
+          key: win-luajit-${{ matrix.or }}-v2
 
       - name: Build LuaJIT (MinGW, static)
         id: build-lj
@@ -345,22 +345,45 @@ jobs:
             GIT_RELVER='(cat ../.relver 2>/dev/null || cat ../../.relver 2>/dev/null || echo 0) >luajit_relver.txt' \
             2>&1 | tee /tmp/luajit-build.log
 
-          # ---- 手工"安装"（Windows 没有 make install）----
+          # ---- 手工"安装"（Windows 下 make install 不可用）----
           mkdir -p "$LJ_DIR/bin" "$LJ_DIR/lib" "$LJ_DIR/include/luajit-2.1" "$LJ_DIR/share/lua/5.1"
           cp luajit.exe "$LJ_DIR/bin/"
           cp libluajit*.a "$LJ_DIR/lib/"
           cp lua.h lualib.h lauxlib.h luaconf.h luajit.h "$LJ_DIR/include/luajit-2.1/"
           cp -r jit "$LJ_DIR/share/lua/5.1/"
+          # luajit.exe 按 luaconf.h 的 LUA_JPATH 在"可执行文件目录/lua/jit"下找 jit.* 模块，
+          # 只放到 share/ 它会报 "jit.* modules not installed"，所以两份都放
+          mkdir -p "$LJ_DIR/bin/lua"
+          cp -r jit "$LJ_DIR/bin/lua/"
+
+          # ---- 关键：库文件名归一化 ----
+          # BUILDMODE=static 时 src/ 下产物固定叫 libluajit.a（不带 ABI 后缀），
+          # 只有 dynamic/mixed 才会生成 libluajit-5.1.a。
+          # 而 OpenResty 的 auto/lib/luajit 是按 -lluajit-5.1 去找的，
+          # 所以必须补一个带版本后缀的副本，否则链接期 "cannot find -lluajit-5.1"。
+          # 复制而不是软链：Windows 上没有 ln -s 的真实软链，且缓存打包会丢链接。
+          if [ ! -f "$LJ_DIR/lib/libluajit-5.1.a" ]; then
+            src="$(ls "$LJ_DIR"/lib/libluajit*.a | head -1)"
+            [ -n "$src" ] || { echo "::error::src/ 下没有产出任何 libluajit*.a"; ls -l "$LJ_DIR/lib"; exit 1; }
+            cp -f "$src" "$LJ_DIR/lib/libluajit-5.1.a"
+            echo "已生成 $LJ_DIR/lib/libluajit-5.1.a <- $src"
+          fi
+
           ls -l "$LJ_DIR/lib/" "$LJ_DIR/include/luajit-2.1/"
-          # 必须有 .a：OpenResty 用 -lluajit-5.1 链接
+          # 断言：OpenResty 用 -lluajit-5.1 链接，这个文件必须存在
           ls "$LJ_DIR/lib/libluajit-5.1.a"
+          # 断言：luajit.exe 能跑起来。jit.* 模块只做告警——即便它没找到，
+          # 也不影响 nginx（OpenResty 用自己的 lualib/jit，且 --with-luajit= 只取 lib/include）
+          "$LJ_DIR/bin/luajit.exe" -e 'print("luajit ok")'
+          "$LJ_DIR/bin/luajit.exe" -e 'print(jit.version)' \
+            2>/dev/null || echo "::warning::jit.* 模块未随 luajit.exe 找到，不影响 nginx 构建"
 
       - name: Save LuaJIT
         if: always() && steps.build-lj.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: C:\opt\luajit-${{ matrix.or }}
-          key: win-luajit-${{ matrix.or }}
+          key: win-luajit-${{ matrix.or }}-v2
 
       # ================= OpenResty =================
       - name: Restore OpenResty
